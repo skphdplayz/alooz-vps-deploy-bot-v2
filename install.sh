@@ -197,7 +197,8 @@ install_system() {
   "${APT[@]}" -f install >/dev/null 2>&1 || true
   "${APT[@]}" update || warn "apt update reported problems, continuing anyway."
   
-  apt-get install -y -o DPkg::Lock::Timeout=300 curl ca-certificates python3 python3-venv python3-pip docker.io \
+  # ttyd and tmux are added for RMUX web terminal
+  apt-get install -y -o DPkg::Lock::Timeout=300 curl ca-certificates python3 python3-venv python3-pip docker.io tmux ttyd \
     || die "Could not install dependencies. Try: apt --fix-broken install"
     
   systemctl enable --now docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1 || true
@@ -356,7 +357,7 @@ async def deploy(interaction: discord.Interaction, member: discord.Member, ram_m
     clean_embed.add_field(name="RAM", value=f"{row['ram_mb']} MB", inline=True)
     clean_embed.add_field(name="CPU", value=f"{row['cpu']:g} Core(s)", inline=True)
     clean_embed.add_field(name="Disk", value=f"{row['disk_gb']} GB", inline=True)
-    clean_embed.add_field(name="🔗 Web Terminal", value="Use `/ssh` to get your public web terminal link.", inline=False)
+    clean_embed.add_field(name="🔗 Web Terminal", value="Use `/ssh` to get your public RMUX web terminal link.", inline=False)
     clean_embed.set_footer(text="ALOOZ HOSTING")
 
     dm_ok = True
@@ -500,9 +501,9 @@ async def vps_info(interaction: discord.Interaction, vps_id: int):
     await interaction.followup.send(embed=vps_embed(row, status, stats=stats), ephemeral=True)
 
 # ==========================================
-# UPDATED /ssh COMMAND WITH WEBTUN LINK
+# UPDATED /ssh COMMAND WITH RMUX TERMINAL LINK
 # ==========================================
-@bot.tree.command(name="ssh", description="Show SSH details and auto-start WebTun public terminal link")
+@bot.tree.command(name="ssh", description="Show SSH details and auto-start RMUX web terminal link")
 @app_commands.describe(vps_id="VPS ID")
 async def ssh(interaction: discord.Interaction, vps_id: int):
     row = await get_vps_for(interaction, vps_id)
@@ -513,27 +514,27 @@ async def ssh(interaction: discord.Interaction, vps_id: int):
     
     if status != "running":
         embed = vps_embed(row, status, show_password=True)
-        embed.add_field(name="⚠️ VPS Stopped", value="Start the VPS first using `/start` to generate a WebTun link.", inline=False)
+        embed.add_field(name="⚠️ VPS Stopped", value="Start the VPS first using `/start` to generate an RMUX terminal link.", inline=False)
         return await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # Auto-start WebTun inside container and grab public URL
+    # Auto-start RMUX (ttyd) inside container and grab public URL
     tunnel_url = None
     try:
-        tunnel_url = await dk.start_webtun_and_get_url(row["container"])
+        tunnel_url = await dk.start_rmux_and_get_url(row["container"], row["ssh_port"])
     except dk.DockerError as exc:
-        log.warning("WebTun start failed for VPS #%s: %s", vps_id, exc)
+        log.warning("RMUX start failed for VPS #%s: %s", vps_id, exc)
 
     embed = vps_embed(row, status, show_password=True)
     
     if tunnel_url:
         embed.add_field(
-            name="🌐 Public Web Terminal (No IPv4 needed)",
+            name="🌐 RMUX Web Terminal (Direct Access)",
             value=f"**[Click here to open terminal]({tunnel_url})**\n*(Opens in any browser. Use your root password to log in.)*",
             inline=False
         )
     else:
         embed.add_field(
-            name="🌐 Web Terminal",
+            name="🌐 RMUX Web Terminal",
             value="Could not generate public link. The VPS might still be booting, or Node.js is not ready. Try `/ssh` again in 30 seconds.",
             inline=False
         )
@@ -707,13 +708,14 @@ class Database:
     def list_admins(self) -> List[int]: return [row["user_id"] for row in self._query("SELECT user_id FROM admins ORDER BY added_at")]
 __ALOOZ_EOF__
 
-  # UPDATED docker_utils.py: Boot script installs WebTun, and function to start it & get URL
+  # UPDATED docker_utils.py: Boot script installs tmux & ttyd for RMUX
   cat > "$INSTALL_DIR/docker_utils.py" <<'__ALOOZ_EOF__'
 """Thin async wrapper around the Docker CLI used to run each VPS as a container."""
 import asyncio, os, re, secrets, shutil, socket, string, time
 from typing import Dict, List
 class DockerError(Exception): pass
 
+# Updated Boot Script: Installs ttyd and tmux for RMUX terminal
 BOOT_SCRIPT = r"""
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -721,13 +723,15 @@ if [ ! -x /usr/sbin/sshd ]; then
   apt-get update -qq
   apt-get install -y -qq openssh-server sudo curl wget nano htop git net-tools iputils-ping ca-certificates >/dev/null
 fi
-# Install Node.js & WebTun for public web terminal
-if [ ! -x /usr/bin/node ]; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
-  apt-get install -y -qq nodejs >/dev/null
-fi
-if ! command -v webtun >/dev/null 2>&1; then
-  npm install -g webtun >/dev/null 2>&1
+
+# Install tmux and ttyd for RMUX Web Terminal
+if ! command -v ttyd >/dev/null 2>&1; then
+  apt-get install -y -qq tmux ttyd >/dev/null 2>&1 || {
+    # Fallback compile if apt package is missing (e.g. older Ubuntu)
+    apt-get install -y -qq build-essential cmake libjson-c-dev libwebsockets-dev >/dev/null
+    cd /tmp && git clone https://github.com/tsl0922/ttyd.git && cd ttyd && mkdir build && cd build
+    cmake .. && make && make install
+  }
 fi
 
 mkdir -p /run/sshd
@@ -735,6 +739,10 @@ if [ -f /etc/alooz_pw ]; then PW="$(cat /etc/alooz_pw)"; else PW="$ROOT_PASSWORD
 echo "root:$PW" | chpasswd
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+
+# Start RMUX (ttyd) in background on port 8080
+nohup ttyd -p 8080 -c root:$PW bash > /tmp/ttyd.log 2>&1 &
+
 exec /usr/sbin/sshd -D -e
 """
 
@@ -760,7 +768,7 @@ def port_is_free(port: int) -> bool:
         except OSError: return False
 
 def build_run_args(name: str, image: str, ram_mb: int, cpu: float, disk_gb: int, port: int, password: str, use_disk_limit: bool = False) -> List[str]:
-    args = ["run", "-d", "--name", name, "--hostname", name, "--restart", "unless-stopped", "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", "--pids-limit", "4096", "-p", f"{port}:22", "-e", f"ROOT_PASSWORD={password}", "--label", "alooz.vps=1"]
+    args = ["run", "-d", "--name", name, "--hostname", name, "--restart", "unless-stopped", "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", "--pids-limit", "4096", "-p", f"{port}:22", "-p", f"{port+1}:8080", "-e", f"ROOT_PASSWORD={password}", "--label", "alooz.vps=1"]
     if use_disk_limit: args += ["--storage-opt", f"size={disk_gb}g"]
     args += [image, "bash", "-c", BOOT_SCRIPT]; return args
 
@@ -792,31 +800,14 @@ async def update_limits(name: str, ram_mb: int, cpu: float) -> None:
     await _docker("update", "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", name, timeout=60)
 
 # ==========================================
-# NEW: Start WebTun inside container & grab URL
+# NEW: RMUX Terminal URL Generator
 # ==========================================
-async def start_webtun_and_get_url(container_name: str, timeout: int = 60) -> str:
-    """Starts webtun inside the container with cloudflare tunnel and returns the public URL."""
-    # Kill any existing webtun to get a fresh link
-    await _run("docker", "exec", container_name, "pkill", "-f", "webtun", timeout=10)
-    
-    # Start webtun with tunnel and no pin (we rely on SSH password for auth)
-    # Use a high port inside container to avoid conflict with sshd on 22
-    cmd = "nohup webtun --port 8080 --tunnel > /tmp/webtun.log 2>&1 &"
-    await _run("docker", "exec", "-d", container_name, "bash", "-c", cmd, timeout=10)
-    
-    # Wait for URL to appear in log
-    url_pattern = re.compile(r'https://[a-zA-Z0-9.-]+\.trycloudflare\.com')
-    start_time = time.time()
-    
-    while time.time() - start_time < timeout:
-        code, out, _ = await _run("docker", "exec", container_name, "cat", "/tmp/webtun.log", timeout=5)
-        if code == 0:
-            match = url_pattern.search(out)
-            if match:
-                return match.group(0)
-        await asyncio.sleep(2)
-    
-    raise DockerError("WebTun URL not found within timeout. The container may still be installing Node.js.")
+async def start_rmux_and_get_url(container_name: str, host_port: int) -> str:
+    """Returns the RMUX URL for the container based on the mapped port."""
+    # Since we mapped host_port + 1 to container's 8080, the URL is just the host IP + port
+    # We assume config.SERVER_IP is the public IP.
+    from config import SERVER_IP
+    return f"http://{SERVER_IP}:{host_port + 1}"
 
 def host_stats() -> Dict[str, float]:
     stats: Dict[str, float] = {"cpus": float(os.cpu_count() or 1)}
