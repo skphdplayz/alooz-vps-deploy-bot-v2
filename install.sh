@@ -356,7 +356,7 @@ async def deploy(interaction: discord.Interaction, member: discord.Member, ram_m
     clean_embed.add_field(name="RAM", value=f"{row['ram_mb']} MB", inline=True)
     clean_embed.add_field(name="CPU", value=f"{row['cpu']:g} Core(s)", inline=True)
     clean_embed.add_field(name="Disk", value=f"{row['disk_gb']} GB", inline=True)
-    clean_embed.add_field(name="🔗 Web Terminal", value="Use `/ssh` to get your public RMUX web terminal link.", inline=False)
+    clean_embed.add_field(name="🔗 Web Terminal", value="Use `/ssh` to get your public SSHX terminal link.", inline=False)
     clean_embed.set_footer(text="ALOOZ HOSTING")
 
     dm_ok = True
@@ -500,9 +500,9 @@ async def vps_info(interaction: discord.Interaction, vps_id: int):
     await interaction.followup.send(embed=vps_embed(row, status, stats=stats), ephemeral=True)
 
 # ==========================================
-# UPDATED /ssh COMMAND WITH CLOUDFLARE TUNNEL
+# UPDATED /ssh COMMAND WITH SSHX
 # ==========================================
-@bot.tree.command(name="ssh", description="Show SSH details and auto-start RMUX web terminal link via Cloudflare")
+@bot.tree.command(name="ssh", description="Show SSH details and auto-start SSHX web terminal link")
 @app_commands.describe(vps_id="VPS ID")
 async def ssh(interaction: discord.Interaction, vps_id: int):
     row = await get_vps_for(interaction, vps_id)
@@ -516,25 +516,25 @@ async def ssh(interaction: discord.Interaction, vps_id: int):
         embed.add_field(name="⚠️ VPS Stopped", value="Start the VPS first using `/start` to generate a web terminal link.", inline=False)
         return await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # Auto-start Cloudflare tunnel inside container and grab public URL
+    # Auto-start SSHX inside container and grab public URL
     tunnel_url = None
     try:
-        tunnel_url = await dk.start_rmux_and_get_url(row["container"])
+        tunnel_url = await dk.start_sshx_and_get_url(row["container"])
     except dk.DockerError as exc:
-        log.warning("WebTun start failed for VPS #%s: %s", vps_id, exc)
+        log.warning("SSHX start failed for VPS #%s: %s", vps_id, exc)
 
     embed = vps_embed(row, status, show_password=True)
     
     if tunnel_url:
         embed.add_field(
-            name="🌐 RMUX Web Terminal (Cloudflare)",
+            name="🌐 SSHX Web Terminal",
             value=f"**[Click here to open terminal]({tunnel_url})**\n*(Opens in any browser. Use your root password to log in.)*",
             inline=False
         )
     else:
         embed.add_field(
-            name="🌐 RMUX Web Terminal",
-            value="Could not generate public link. The VPS might still be booting, or Cloudflare tunnel is not ready. Try `/ssh` again in 30 seconds.",
+            name="🌐 SSHX Web Terminal",
+            value="Could not generate public link. The VPS might still be booting, or sshx is not ready. Try `/ssh` again in 30 seconds.",
             inline=False
         )
     
@@ -707,14 +707,14 @@ class Database:
     def list_admins(self) -> List[int]: return [row["user_id"] for row in self._query("SELECT user_id FROM admins ORDER BY added_at")]
 __ALOOZ_EOF__
 
-  # UPDATED docker_utils.py: Boot script installs cloudflared for IPv4-less Web Terminal
+  # UPDATED docker_utils.py: Replaced ttyd/cloudflared with SSHX
   cat > "$INSTALL_DIR/docker_utils.py" <<'__ALOOZ_EOF__'
 """Thin async wrapper around the Docker CLI used to run each VPS as a container."""
 import asyncio, os, re, secrets, shutil, socket, string, time
 from typing import Dict, List
 class DockerError(Exception): pass
 
-# Updated Boot Script: Installs ttyd, tmux, and cloudflared for IPv4-less Web Terminal
+# Updated Boot Script: Installs SSHX instead of ttyd/cloudflared
 BOOT_SCRIPT = r"""
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -723,19 +723,11 @@ if [ ! -x /usr/sbin/sshd ]; then
   apt-get install -y -qq openssh-server sudo curl wget nano htop git net-tools iputils-ping ca-certificates >/dev/null
 fi
 
-# Install tmux and ttyd
-if ! command -v ttyd >/dev/null 2>&1; then
-  apt-get install -y -qq tmux ttyd >/dev/null 2>&1 || {
-    apt-get install -y -qq build-essential cmake libjson-c-dev libwebsockets-dev >/dev/null
-    cd /tmp && git clone https://github.com/tsl0922/ttyd.git && cd ttyd && mkdir build && cd build
-    cmake .. && make && make install
-  }
-fi
-
-# Install Cloudflare Tunnel (cloudflared) for IPv6/IPv4-less access
-if ! command -v cloudflared >/dev/null 2>&1; then
-  curl -L --output /usr/local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-  chmod +x /usr/local/bin/cloudflared
+# Install SSHX
+if ! command -v sshx >/dev/null 2>&1; then
+  curl -sSf https://sshx.io/get | sh >/dev/null 2>&1
+  mv /root/.sshx/bin/sshx /usr/local/bin/ 2>/dev/null || true
+  chmod +x /usr/local/bin/sshx 2>/dev/null || true
 fi
 
 mkdir -p /run/sshd
@@ -744,11 +736,8 @@ echo "root:$PW" | chpasswd
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
 
-# Start RMUX (ttyd) on port 8080 in background
-nohup ttyd -p 8080 -c root:$PW bash > /tmp/ttyd.log 2>&1 &
-
-# Start Cloudflare Tunnel for ttyd (Port 8080) in background
-nohup cloudflared tunnel --url http://localhost:8080 > /tmp/cloudflared.log 2>&1 &
+# Start SSHX in background
+nohup sshx > /tmp/sshx.log 2>&1 &
 
 exec /usr/sbin/sshd -D -e
 """
@@ -775,7 +764,7 @@ def port_is_free(port: int) -> bool:
         except OSError: return False
 
 def build_run_args(name: str, image: str, ram_mb: int, cpu: float, disk_gb: int, port: int, password: str, use_disk_limit: bool = False) -> List[str]:
-    # Port 8080 is NOT exposed to the host anymore, because Cloudflare handles it inside the container.
+    # No extra ports needed for SSHX, as it uses outbound connections
     args = ["run", "-d", "--name", name, "--hostname", name, "--restart", "unless-stopped", "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", "--pids-limit", "4096", "-p", f"{port}:22", "-e", f"ROOT_PASSWORD={password}", "--label", "alooz.vps=1"]
     if use_disk_limit: args += ["--storage-opt", f"size={disk_gb}g"]
     args += [image, "bash", "-c", BOOT_SCRIPT]; return args
@@ -808,30 +797,30 @@ async def update_limits(name: str, ram_mb: int, cpu: float) -> None:
     await _docker("update", "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", name, timeout=60)
 
 # ==========================================
-# UPDATED: RMUX Terminal URL via Cloudflare Tunnel
+# UPDATED: SSHX Terminal URL Generator
 # ==========================================
-async def start_rmux_and_get_url(container_name: str) -> str:
-    """Reads the Cloudflare tunnel URL from the container logs."""
-    # Kill existing tunnels to get a new URL
-    await _run("docker", "exec", container_name, "pkill", "-f", "cloudflared", timeout=10)
+async def start_sshx_and_get_url(container_name: str) -> str:
+    """Reads the SSHX URL from the container logs."""
+    # Kill existing sshx to get a new URL
+    await _run("docker", "exec", container_name, "pkill", "-f", "sshx", timeout=10)
     await asyncio.sleep(2)
     
-    # Restart cloudflared
-    cmd = "nohup cloudflared tunnel --url http://localhost:8080 > /tmp/cloudflared.log 2>&1 &"
+    # Restart sshx
+    cmd = "nohup sshx > /tmp/sshx.log 2>&1 &"
     await _run("docker", "exec", "-d", container_name, "bash", "-c", cmd, timeout=10)
     
-    url_pattern = re.compile(r'https://[a-zA-Z0-9.-]+\.trycloudflare\.com')
+    url_pattern = re.compile(r'https://sshx\.io/s/[a-zA-Z0-9]+')
     
     # Wait up to 30 seconds for the URL
     for _ in range(15):
-        code, out, _ = await _run("docker", "exec", container_name, "cat", "/tmp/cloudflared.log", timeout=5)
+        code, out, _ = await _run("docker", "exec", container_name, "cat", "/tmp/sshx.log", timeout=5)
         if code == 0:
             match = url_pattern.search(out)
             if match:
                 return match.group(0)
         await asyncio.sleep(2)
     
-    raise DockerError("Could not generate Cloudflare Tunnel URL. Check if the container has internet access.")
+    raise DockerError("Could not generate SSHX URL. Check if the container has internet access.")
 
 def host_stats() -> Dict[str, float]:
     stats: Dict[str, float] = {"cpus": float(os.cpu_count() or 1)}
@@ -1018,7 +1007,7 @@ if [ ! -f "$SYSTEMD_DIR/$SERVICE.service" ]; then
   install_system
   
   if [ ! -f "$ENV_FILE" ]; then
-    say "First-time configuration needed."
+  say "First-time configuration needed."
     set_token_interactive
     set_owner_interactive
   fi
