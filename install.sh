@@ -197,7 +197,7 @@ install_system() {
   "${APT[@]}" -f install >/dev/null 2>&1 || true
   "${APT[@]}" update || warn "apt update reported problems, continuing anyway."
   
-  apt-get install -y -o DPkg::Lock::Timeout=300 curl ca-certificates python3 python3-venv python3-pip docker.io ttyd \
+  apt-get install -y -o DPkg::Lock::Timeout=300 curl ca-certificates python3 python3-venv python3-pip docker.io \
     || die "Could not install dependencies. Try: apt --fix-broken install"
     
   systemctl enable --now docker >/dev/null 2>&1 || service docker start >/dev/null 2>&1 || true
@@ -281,7 +281,7 @@ def vps_embed(row: sqlite3.Row, status: str, *, show_password: bool = False, sta
     embed.add_field(name="RAM", value=f"{row['ram_mb']} MB")
     embed.add_field(name="CPU", value=f"{row['cpu']:g} core(s)")
     embed.add_field(name="Disk", value=f"{row['disk_gb']} GB")
-    embed.add_field(name="SSH / Web Terminal", value=f"`ssh root@{config.SERVER_IP} -p {row['ssh_port']}`\nOr use `/terminal {row['id']}` for web browser.", inline=False)
+    embed.add_field(name="SSH", value=f"`ssh root@{config.SERVER_IP} -p {row['ssh_port']}`", inline=False)
     if show_password: embed.add_field(name="Root password", value=f"||{row['root_password']}||", inline=False)
     if stats: embed.add_field(name="Live usage", value=f"CPU: {stats['cpu']}\nRAM: {stats['mem']}\nNetwork: {stats['net']}\nDisk I/O: {stats['block']}\nProcesses: {stats['pids']}", inline=False)
     embed.set_footer(text=config.BOT_NAME)
@@ -327,9 +327,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except discord.HTTPException: pass
 OS_CHOICES = [app_commands.Choice(name="Ubuntu 22.04", value="ubuntu:22.04"), app_commands.Choice(name="Ubuntu 24.04", value="ubuntu:24.04"), app_commands.Choice(name="Debian 12", value="debian:12")]
 
-# ==========================================
-# UPDATED DEPLOY COMMAND WITH CLEAN DM
-# ==========================================
 @bot.tree.command(name="deploy", description="[Admin] Create a VPS for a member")
 @app_commands.describe(member="Member who will receive the VPS", ram_mb="RAM in MB", cpu="CPU cores", disk_gb="Disk size in GB", os_image="Operating system")
 @app_commands.rename(os_image="os")
@@ -353,17 +350,13 @@ async def deploy(interaction: discord.Interaction, member: discord.Member, ram_m
             db.delete_vps(vps_id)
             return await interaction.followup.send(f"Deploy failed: {short(exc)}", ephemeral=True)
 
-    # Clean Embed for DM (No password, no admin info)
     clean_embed = discord.Embed(title=f"🎉 Your VPS is Ready! #{vps_id}", color=discord.Color.green())
     clean_embed.add_field(name="Owner ID", value=f"`{row['owner_id']}`", inline=False)
     clean_embed.add_field(name="OS", value=row['os_image'], inline=True)
     clean_embed.add_field(name="RAM", value=f"{row['ram_mb']} MB", inline=True)
     clean_embed.add_field(name="CPU", value=f"{row['cpu']:g} Core(s)", inline=True)
     clean_embed.add_field(name="Disk", value=f"{row['disk_gb']} GB", inline=True)
-    
-    term_port = row['ssh_port'] + 10000
-    url = f"http://{config.SERVER_IP}:{term_port}"
-    clean_embed.add_field(name="🔗 Web Terminal Link", value=f"**[Click Here to Open Terminal]({url})**\n*(Use this if SSH is not working)*", inline=False)
+    clean_embed.add_field(name="🔗 Web Terminal", value="Use `/ssh` to get your public web terminal link.", inline=False)
     clean_embed.set_footer(text="ALOOZ HOSTING")
 
     dm_ok = True
@@ -506,41 +499,45 @@ async def vps_info(interaction: discord.Interaction, vps_id: int):
         except dk.DockerError: pass
     await interaction.followup.send(embed=vps_embed(row, status, stats=stats), ephemeral=True)
 
-@bot.tree.command(name="ssh", description="Show SSH details and Password")
+# ==========================================
+# UPDATED /ssh COMMAND WITH WEBTUN LINK
+# ==========================================
+@bot.tree.command(name="ssh", description="Show SSH details and auto-start WebTun public terminal link")
 @app_commands.describe(vps_id="VPS ID")
 async def ssh(interaction: discord.Interaction, vps_id: int):
     row = await get_vps_for(interaction, vps_id)
     if row is None: return
     await interaction.response.defer(ephemeral=True, thinking=True)
+    
     status = await dk.container_status(row["container"])
-    await interaction.followup.send(embed=vps_embed(row, status, show_password=True), ephemeral=True)
+    
+    if status != "running":
+        embed = vps_embed(row, status, show_password=True)
+        embed.add_field(name="⚠️ VPS Stopped", value="Start the VPS first using `/start` to generate a WebTun link.", inline=False)
+        return await interaction.followup.send(embed=embed, ephemeral=True)
 
-# ==========================================
-# WEB TERMINAL COMMAND WITH STATUS BAR
-# ==========================================
-@bot.tree.command(name="terminal", description="Get the Web Terminal link to access your VPS")
-@app_commands.describe(vps_id="VPS ID")
-async def terminal(interaction: discord.Interaction, vps_id: int):
-    row = await get_vps_for(interaction, vps_id)
-    if row is None: return
+    # Auto-start WebTun inside container and grab public URL
+    tunnel_url = None
+    try:
+        tunnel_url = await dk.start_webtun_and_get_url(row["container"])
+    except dk.DockerError as exc:
+        log.warning("WebTun start failed for VPS #%s: %s", vps_id, exc)
+
+    embed = vps_embed(row, status, show_password=True)
     
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    if tunnel_url:
+        embed.add_field(
+            name="🌐 Public Web Terminal (No IPv4 needed)",
+            value=f"**[Click here to open terminal]({tunnel_url})**\n*(Opens in any browser. Use your root password to log in.)*",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="🌐 Web Terminal",
+            value="Could not generate public link. The VPS might still be booting, or Node.js is not ready. Try `/ssh` again in 30 seconds.",
+            inline=False
+        )
     
-    if await dk.container_status(row["container"]) != "running":
-        return await interaction.followup.send("VPS is stopped. Start it first using `/start`.", ephemeral=True)
-    
-    server_ip = config.SERVER_IP
-    term_port = row["ssh_port"] + 10000
-    url = f"http://{server_ip}:{term_port}"
-    
-    embed = discord.Embed(title=f"🖥️ Web Terminal for VPS #{vps_id}", color=discord.Color.green())
-    embed.description = (
-        f"Click the link below to open the terminal directly in your browser:\n\n"
-        f"👉 **[Open Web Terminal]({url})**\n\n"
-        f"**Username:** `root`\n"
-        f"**Password:** ||{row['root_password']}||\n\n"
-        f"*(Note: Inside the terminal, a live status bar will show your CPU, RAM, and Disk usage.)*"
-    )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 async def power_action(interaction: discord.Interaction, vps_id: int, action: str) -> None:
@@ -583,7 +580,7 @@ async def ping(interaction: discord.Interaction): await reply(interaction, f"Pon
 @bot.tree.command(name="help", description="Show commands")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title=f"{config.BOT_NAME} • Help", color=discord.Color.blurple())
-    embed.add_field(name="Your VPS", value="`/myvps` `/vps_info` `/ssh` `/terminal` `/start` `/stop` `/restart` `/reset_password`", inline=False)
+    embed.add_field(name="Your VPS", value="`/myvps` `/vps_info` `/ssh` `/start` `/stop` `/restart` `/reset_password`", inline=False)
     if is_admin(interaction.user.id):
         embed.add_field(name="Admin", value="`/deploy` `/listall` `/delete` `/suspend` `/unsuspend` `/resize` `/node` `/admin_list`", inline=False)
     if is_owner(interaction.user.id): embed.add_field(name="Owner", value="`/admin_add` `/admin_remove`", inline=False)
@@ -710,14 +707,13 @@ class Database:
     def list_admins(self) -> List[int]: return [row["user_id"] for row in self._query("SELECT user_id FROM admins ORDER BY added_at")]
 __ALOOZ_EOF__
 
-  # Modified Docker Utils to add auto-start TTYD with status bar
+  # UPDATED docker_utils.py: Boot script installs WebTun, and function to start it & get URL
   cat > "$INSTALL_DIR/docker_utils.py" <<'__ALOOZ_EOF__'
 """Thin async wrapper around the Docker CLI used to run each VPS as a container."""
-import asyncio, os, secrets, shutil, socket, string
+import asyncio, os, re, secrets, shutil, socket, string, time
 from typing import Dict, List
 class DockerError(Exception): pass
 
-# TTYD web terminal with live status bar (CPU, RAM, Disk)
 BOOT_SCRIPT = r"""
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -725,27 +721,20 @@ if [ ! -x /usr/sbin/sshd ]; then
   apt-get update -qq
   apt-get install -y -qq openssh-server sudo curl wget nano htop git net-tools iputils-ping ca-certificates >/dev/null
 fi
-if [ ! -x /usr/bin/ttyd ]; then
-  apt-get install -y -qq ttyd >/dev/null || true
+# Install Node.js & WebTun for public web terminal
+if [ ! -x /usr/bin/node ]; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
+  apt-get install -y -qq nodejs >/dev/null
 fi
+if ! command -v webtun >/dev/null 2>&1; then
+  npm install -g webtun >/dev/null 2>&1
+fi
+
 mkdir -p /run/sshd
 if [ -f /etc/alooz_pw ]; then PW="$(cat /etc/alooz_pw)"; else PW="$ROOT_PASSWORD"; echo "$PW" > /etc/alooz_pw; chmod 600 /etc/alooz_pw; fi
 echo "root:$PW" | chpasswd
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-
-# Start TTYD on port 22 (Since Docker maps this port, it will be accessible on host)
-if [ -x /usr/bin/ttyd ]; then
-  cat > /root/.bashrc <<'EOF'
-export PS1="\[\033[1;32m\]\u@\h\[\033[0m\]:\[\033[1;34m\]\w\[\033[0m\]\$ "
-echo -e "\033[1;36m--- LIVE SYSTEM STATUS ---\033[0m"
-echo -e "CPU Load: \033[1;33m$(top -bn1 | grep load | awk '{print $10, $11, $12}')\033[0m"
-echo -e "RAM: \033[1;33m$(free -h | awk '/^Mem:/ {print $3 "/" $2}')\033[0m"
-echo -e "Disk: \033[1;33m$(df -h / | awk 'NR==2 {print $3 "/" $2}')\033[0m"
-echo -e "\033[1;36m--------------------------\033[0m"
-EOF
-  ttyd -p 22 -W bash &
-fi
 exec /usr/sbin/sshd -D -e
 """
 
@@ -771,7 +760,7 @@ def port_is_free(port: int) -> bool:
         except OSError: return False
 
 def build_run_args(name: str, image: str, ram_mb: int, cpu: float, disk_gb: int, port: int, password: str, use_disk_limit: bool = False) -> List[str]:
-    args = ["run", "-d", "--name", name, "--hostname", name, "--restart", "unless-stopped", "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", "--pids-limit", "4096", "-p", f"{port}:22", "-p", f"{port+10000}:22", "-e", f"ROOT_PASSWORD={password}", "--label", "alooz.vps=1"]
+    args = ["run", "-d", "--name", name, "--hostname", name, "--restart", "unless-stopped", "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", "--pids-limit", "4096", "-p", f"{port}:22", "-e", f"ROOT_PASSWORD={password}", "--label", "alooz.vps=1"]
     if use_disk_limit: args += ["--storage-opt", f"size={disk_gb}g"]
     args += [image, "bash", "-c", BOOT_SCRIPT]; return args
 
@@ -801,6 +790,33 @@ async def set_password(name: str, password: str) -> None:
 
 async def update_limits(name: str, ram_mb: int, cpu: float) -> None:
     await _docker("update", "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", name, timeout=60)
+
+# ==========================================
+# NEW: Start WebTun inside container & grab URL
+# ==========================================
+async def start_webtun_and_get_url(container_name: str, timeout: int = 60) -> str:
+    """Starts webtun inside the container with cloudflare tunnel and returns the public URL."""
+    # Kill any existing webtun to get a fresh link
+    await _run("docker", "exec", container_name, "pkill", "-f", "webtun", timeout=10)
+    
+    # Start webtun with tunnel and no pin (we rely on SSH password for auth)
+    # Use a high port inside container to avoid conflict with sshd on 22
+    cmd = "nohup webtun --port 8080 --tunnel > /tmp/webtun.log 2>&1 &"
+    await _run("docker", "exec", "-d", container_name, "bash", "-c", cmd, timeout=10)
+    
+    # Wait for URL to appear in log
+    url_pattern = re.compile(r'https://[a-zA-Z0-9.-]+\.trycloudflare\.com')
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        code, out, _ = await _run("docker", "exec", container_name, "cat", "/tmp/webtun.log", timeout=5)
+        if code == 0:
+            match = url_pattern.search(out)
+            if match:
+                return match.group(0)
+        await asyncio.sleep(2)
+    
+    raise DockerError("WebTun URL not found within timeout. The container may still be installing Node.js.")
 
 def host_stats() -> Dict[str, float]:
     stats: Dict[str, float] = {"cpus": float(os.cpu_count() or 1)}
@@ -886,6 +902,58 @@ menu_reinstall_system() {
   say "Reinstall complete! Check logs with: journalctl -u $SERVICE -f"
 }
 
+menu_bot_status() {
+  say "--- Bot System Status ---"
+  if systemctl is-active --quiet "$SERVICE"; then
+    echo -e "Bot Status: \033[1;32mRUNNING\033[0m"
+  else
+    echo -e "Bot Status: \033[1;31mSTOPPED / FAILED\033[0m"
+  fi
+  
+  echo -e "\nDocker Status:"
+  if systemctl is-active --quiet docker; then
+    echo -e "Docker: \033[1;32mRUNNING\033[0m"
+    echo "Active VPS Containers:"
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep "alooz-vps" || echo "No active VPS."
+  else
+    echo -e "Docker: \033[1;31mNOT RUNNING\033[0m"
+  fi
+
+  echo -e "\nSystem Resources:"
+  echo "CPU Load: $(uptime | awk -F'load average:' '{ print $2 }')"
+  echo "RAM Usage: $(free -h | awk '/^Mem:/ {print $3 "/" $2}')"
+  echo "Disk Usage: $(df -h / | awk 'NR==2 {print $3 "/" $2}')"
+}
+
+menu_delete_all() {
+  warn "--- DELETE ALL SYSTEM ---"
+  warn "WARNING: This will DELETE all VPS containers, all user data, and the bot database."
+  local confirm=""
+  ask confirm "Are you absolutely sure? Type 'YES' to confirm"
+  if [ "$confirm" != "YES" ]; then
+    say "Deletion cancelled."
+    return
+  fi
+
+  say "Stopping and deleting all VPS containers..."
+  docker ps -a --filter "label=alooz.vps=1" -q | xargs -r docker rm -f >/dev/null 2>&1 || true
+
+  say "Stopping bot service..."
+  systemctl stop "$SERVICE" >/dev/null 2>&1 || true
+
+  say "Deleting all bot files and database..."
+  rm -rf "$INSTALL_DIR"
+
+  say "Disabling service..."
+  systemctl disable "$SERVICE" >/dev/null 2>&1 || true
+  rm -f "$SYSTEMD_DIR/$SERVICE.service"
+  systemctl daemon-reload
+
+  say "All system data has been deleted."
+  say "You can now restart fresh by running this script again."
+  exit 0
+}
+
 # ----------------------------------------------------------------------
 # Main Menu
 # ----------------------------------------------------------------------
@@ -900,11 +968,13 @@ main_menu() {
     echo -e "  \033[1;33m3.\033[0m Reset Owner ID"
     echo -e "  \033[1;33m4.\033[0m Update Full System (apt upgrade)"
     echo -e "  \033[1;33m5.\033[0m Reinstall Full System (Bot Files)"
-    echo -e "  \033[1;33m6.\033[0m Exit"
+    echo -e "  \033[1;33m6.\033[0m Bot Status & System Resources"
+    echo -e "  \033[1;31m7. Delete All System (Danger)\033[0m"
+    echo -e "  \033[1;33m8.\033[0m Exit"
     echo -e "\033[1;36m=========================================\033[0m"
     
     local choice=""
-    ask choice "Enter your choice [1-6]"
+    ask choice "Enter your choice [1-8]"
     
     case "$choice" in
       1) menu_set_token_and_owner ;;
@@ -912,8 +982,10 @@ main_menu() {
       3) menu_reset_owner ;;
       4) menu_update_system ;;
       5) menu_reinstall_system ;;
-      6) say "Exiting... Goodbye!"; exit 0 ;;
-      *) warn "Invalid choice! Please enter a number between 1 and 6." ;;
+      6) menu_bot_status ;;
+      7) menu_delete_all ;;
+      8) say "Exiting... Goodbye!"; exit 0 ;;
+      *) warn "Invalid choice! Please enter a number between 1 and 8." ;;
     esac
     echo ""
     ask _dummy "Press Enter to return to the menu..."
