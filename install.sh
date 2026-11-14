@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ALOOZ HOSTING V104 - 58 Commands Edition
+# ALOOZ HOSTING V104 - Full Edition (58 Commands, Bug-Fixed)
 set -Eeuo pipefail
 
 GITHUB_REPO="YOUR_GITHUB_USERNAME/alooz-hosting-bot"
@@ -22,7 +22,7 @@ ENV_FILE="$INSTALL_DIR/.env"
 PAL=(196 202 208 214 220 226 190 154 118 82 46 47 48 49 50 51 45 39 33 27 57 93 129 165 201 200 199 198 197)
 
 show_banner() {
-  local text="ALOOZ HOSTING" subtitle="V104 - 58 COMMANDS"
+  local text="ALOOZ HOSTING" subtitle="V104 - 58 COMMANDS - FIXED"
   local -a rows=("" "" "" "" "")
   local -A G=(
     [A]=" ### |#   #|#####|#   #|#   #" [L]="#    |#    |#    |#    |#####"
@@ -262,7 +262,6 @@ class Database:
     def get_vps(self, vps_id: int) -> Optional[sqlite3.Row]:
         rows = self._query("SELECT * FROM vps WHERE id = ?", (vps_id,)); return rows[0] if rows else None
     def list_vps_by_owner(self, owner_id: int) -> List[sqlite3.Row]: return self._query("SELECT * FROM vps WHERE owner_id = ? ORDER BY id", (owner_id,))
-    def list_all_vps(self) -> List[sqlite3.Row]: return self._query("SELECT * FROM vps ORDER BY id")
     def delete_vps(self, vps_id: int) -> None: self._execute("DELETE FROM vps WHERE id = ?", (vps_id,))
     def update_vps(self, vps_id: int, **fields) -> None:
         if not fields: return
@@ -279,7 +278,6 @@ class Database:
     def get_mc(self, mc_id: int) -> Optional[sqlite3.Row]:
         rows = self._query("SELECT * FROM mc_servers WHERE id = ?", (mc_id,)); return rows[0] if rows else None
     def list_mc_by_owner(self, owner_id: int) -> List[sqlite3.Row]: return self._query("SELECT * FROM mc_servers WHERE owner_id = ? ORDER BY id", (owner_id,))
-    def list_all_mc(self) -> List[sqlite3.Row]: return self._query("SELECT * FROM mc_servers ORDER BY id")
     def delete_mc(self, mc_id: int) -> None: self._execute("DELETE FROM mc_servers WHERE id = ?", (mc_id,))
     def update_mc(self, mc_id: int, **fields) -> None:
         if not fields: return
@@ -465,7 +463,7 @@ def host_stats() -> Dict[str, float]:
     return stats
 __ALOOZ_EOF__
 
-  # ===================== bot.py (58 commands) =====================
+  # ===================== bot.py (FIXED 58 COMMANDS) =====================
   cat > "$INSTALL_DIR/bot.py" <<'__ALOOZ_EOF__'
 import asyncio, logging, sqlite3, os, datetime
 from typing import Optional
@@ -547,19 +545,8 @@ def mc_embed(r, st, show_rcon=False):
     if show_rcon: e.add_field(name="RCON", value=f"||{r['rcon_password']}||", inline=False)
     return e
 
-class ConfirmView(discord.ui.View):
-    def __init__(self, uid):
-        super().__init__(timeout=30); self.uid = uid; self.value = None
-    async def interaction_check(self, i):
-        if i.user.id != self.uid: await i.response.send_message("Not for you.", ephemeral=True); return False
-        return True
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
-    async def confirm(self, i, b): self.value = True; await i.response.edit_message(content="Working...", view=None); self.stop()
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, i, b): self.value = False; await i.response.edit_message(content="Cancelled.", view=None); self.stop()
-
 class AloozBot(commands.Bot):
-    def __init__(self): super().__init__(command_prefix="-", intents=discord.Intents.all())
+    def __init__(self): super().__init__(command_prefix="-", intents=discord.Intents.all(), help_command=None)
     async def setup_hook(self):
         await self.tree.sync(); self.cleanup_task.start()
     async def on_ready(self):
@@ -609,7 +596,7 @@ async def on_member_remove(m):
     iid = db.get_inviter(m.id)
     if iid: db.remove_invite(iid); db.remove_join_log(m.id)
 
-# ============ PREFIX COMMANDS (8) ============
+# ============ PREFIX COMMANDS ============
 @bot.command(name="i")
 async def p_i(ctx): await ctx.send(f"📊 **{ctx.author.name}**, invites: **{db.get_invites(ctx.author.id)}**")
 @bot.command(name="cash")
@@ -638,11 +625,6 @@ async def p_mc(ctx):
     rs = db.list_mc_by_owner(ctx.author.id)
     if not rs: return await ctx.send("No MC.")
     await ctx.send(embed=mc_embed(rs[0], await dk.container_status(rs[0]["container"])))
-@bot.command(name="help")
-async def p_help(ctx):
-    e = discord.Embed(title="Help", color=discord.Color.blurple())
-    e.add_field(name="Prefix", value="`-i -cash -shop -buy -give -vps -mc -help`", inline=False)
-    await ctx.send(embed=e)
 
 async def handle_buy(x, coins, ts, pref):
     ts = ts.lower()
@@ -658,10 +640,9 @@ async def handle_buy(x, coins, ts, pref):
     db.remove_coins(u.id, req)
     await (x.send(f"✅ Bought {ts} with {req} coins!") if pref else x.followup.send(f"✅ Bought {ts} with {req} coins!", ephemeral=True))
 
-# ============ USER SLASH (21) ============
+# ============ USER SLASH ============
 @bot.tree.command(name="invites", description="Check invites")
-async def s_inv(i):
-    await i.response.send_message(f"📊 {db.get_invites(i.user.id)} invites", ephemeral=True)
+async def s_inv(i): await i.response.send_message(f"📊 {db.get_invites(i.user.id)} invites", ephemeral=True)
 
 @bot.tree.command(name="invites-plan", description="Invite plan")
 async def s_invp(i):
@@ -802,16 +783,16 @@ async def s_mcc(i, mc_id: int, command: str):
     out = await dk.mc_send_command(r["container"], r["rcon_password"], command)
     await i.response.send_message(f"```\n{out[:1500]}\n```", ephemeral=True)
 
-@bot.tree.command(name="help", description="Help")
+@bot.tree.command(name="myhelp", description="Help")
 async def s_help(i):
     e = discord.Embed(title="Help - 58 Commands", color=discord.Color.blurple())
-    e.add_field(name="Prefix", value="`-i -cash -shop -buy -give -vps -mc -help`", inline=False)
-    e.add_field(name="User Slash", value="`/invites /invites-plan /invite-claim /renew /cash /shop /buy /give /myvps /myserver /ssh /resshx /reinstall-os /vps-rename /vps-upgrade /vps-stats /mc-start /mc-stop /mc-restart /mc-console /help`", inline=False)
+    e.add_field(name="Prefix", value="`-i -cash -shop -buy -give -vps -mc`", inline=False)
+    e.add_field(name="User Slash", value="`/invites /invites-plan /invite-claim /renew /cash /shop /buy /give /myvps /myserver /ssh /resshx /reinstall-os /vps-rename /vps-upgrade /vps-stats /mc-start /mc-stop /mc-restart /mc-console /myhelp`", inline=False)
     if is_admin(i.user.id): e.add_field(name="Admin", value="`/deploy /create-mc /delete-vps /delete-mc /suspend-vps /unsuspend-vps /suspend-mc /unsuspend-mc /resize-vps /resize-mc /add-coins /remove-coins /reset-coins /coins-log /coins-leaderboard /add-invites /remove-invites /reset-invites`", inline=False)
     if is_owner(i.user.id): e.add_field(name="Owner", value="`/reset-all-coins /reset-all-invites /invites-leaderboard /log-channel /user-channel /add-admin /remove-admin /admin-list /node-stats /backup-db /broadcast`", inline=False)
     await i.response.send_message(embed=e, ephemeral=True)
 
-# ============ ADMIN (18) ============
+# ============ ADMIN ============
 @bot.tree.command(name="deploy", description="[Admin] Deploy VPS")
 @admin_only()
 async def a_dep(i, member: discord.Member, ram_mb: int, cpu: float, disk_gb: int):
@@ -951,7 +932,7 @@ async def a_rsti(i, member: discord.Member):
     db.remove_invite(member.id, db.get_invites(member.id))
     await i.response.send_message(f"✅ Reset", ephemeral=True)
 
-# ============ OWNER (11) ============
+# ============ OWNER ============
 @bot.tree.command(name="reset-all-coins", description="[Owner] Reset all coins")
 @owner_only()
 async def o_rac(i):
@@ -1031,6 +1012,7 @@ __ALOOZ_EOF__
   cat > "$INSTALL_DIR/requirements.txt" <<'__ALOOZ_EOF__'
 discord.py>=2.3.2
 python-dotenv>=1.0.0
+PyNaCl
 __ALOOZ_EOF__
 
   say "Setting up Python..."

@@ -15,7 +15,7 @@
 `-i`, `-cash`, `-shop`, `-buy`, `-give`, `-vps`, `-mc`, `-help`
 
 ### User Slash (21)
-`/invites`, `/invites-plan`, `/invite-claim`, `/renew`, `/cash`, `/shop`, `/buy`, `/give`, `/myvps`, `/myserver`, `/ssh`, `/resshx`, `/reinstall-os`, `/vps-rename`, `/vps-upgrade`, `/vps-stats`, `/mc-start`, `/mc-stop`, `/mc-restart`, `/mc-console`, `/help`
+`/invites`, `/invites-plan`, `/invite-claim`, `/renew`, `/cash`, `/shop`, `/buy`, `/give`, `/myvps`, `/myserver`, `/ssh`, `/resshx`, `/reinstall-os`, `/vps-rename`, `/vps-upgrade`, `/vps-stats`, `/mc-start`, `/mc-stop`, `/mc-restart`, `/mc-console`, `/myhelp`
 
 ### Admin (18)
 `/deploy`, `/create-mc`, `/delete-vps`, `/delete-mc`, `/suspend-vps`, `/unsuspend-vps`, `/suspend-mc`, `/unsuspend-mc`, `/resize-vps`, `/resize-mc`, `/add-coins`, `/remove-coins`, `/reset-coins`, `/coins-log`, `/coins-leaderboard`, `/add-invites`, `/remove-invites`, `/reset-invites`
