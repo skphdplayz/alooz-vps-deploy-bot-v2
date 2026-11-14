@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ALOOZ HOSTING V100 - VPS + Minecraft Hosting + Invite System Installer
+# ALOOZ HOSTING V101 - VPS + Minecraft Hosting + Advanced Invite System
 set -Eeuo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-/opt/alooz-bot}"
@@ -277,7 +277,7 @@ def play_banner(text: str = "ALOOZ HOSTING", subtitle: str = "VPS + MINECRAFT + 
 if __name__ == "__main__": play_banner()
 __ALOOZ_EOF__
 
-  # ===================== database.py (FULL V100 + Invite) =====================
+  # ===================== database.py (V101) =====================
   cat > "$INSTALL_DIR/database.py" <<'__ALOOZ_EOF__'
 """SQLite storage for VPS + Minecraft + Invites."""
 import sqlite3, threading, time, uuid
@@ -322,12 +322,9 @@ class Database:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(SCHEMA); self._conn.commit()
-            try: self._conn.execute("ALTER TABLE vps ADD COLUMN name TEXT NOT NULL DEFAULT 'My VPS'")
-            except sqlite3.OperationalError: pass
-            try: self._conn.execute("ALTER TABLE vps ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0")
-            except sqlite3.OperationalError: pass
-            try: self._conn.execute("ALTER TABLE mc_servers ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0")
-            except sqlite3.OperationalError: pass
+            for col, table in [("name", "vps"), ("expires_at", "vps"), ("expires_at", "mc_servers")]:
+                try: self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT NOT NULL DEFAULT '0'")
+                except sqlite3.OperationalError: pass
 
     def _execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -339,7 +336,7 @@ class Database:
     # ---------------- VPS ----------------
     def add_vps(self, owner_id: int, ram_mb: int, cpu: float, disk_gb: int, ssh_port: int, root_password: str, os_image: str, server_ip: str = "") -> int:
         placeholder = f"pending-{uuid.uuid4().hex}"
-        expiry = int(time.time()) + (30 * 24 * 60 * 60) # 30 Days
+        expiry = int(time.time()) + (30 * 24 * 60 * 60)
         cur = self._execute(
             "INSERT INTO vps (owner_id, container, ram_mb, cpu, disk_gb, ssh_port, root_password, os_image, server_ip, created_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (owner_id, placeholder, ram_mb, cpu, disk_gb, ssh_port, root_password, os_image, server_ip, int(time.time()), expiry))
@@ -397,7 +394,7 @@ class Database:
     def is_admin(self, user_id: int) -> bool: return bool(self._query("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)))
     def list_admins(self) -> List[int]: return [row["user_id"] for row in self._query("SELECT user_id FROM admins ORDER BY added_at")]
 
-    # ---------------- Invite System ----------------
+    # ---------------- Invites ----------------
     def get_invites(self, user_id: int) -> int:
         row = self._query("SELECT total FROM invites WHERE user_id = ?", (user_id,))
         return row[0]["total"] if row else 0
@@ -405,11 +402,11 @@ class Database:
     def add_invite(self, user_id: int, amount: int):
         self._execute("INSERT INTO invites (user_id, total) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET total = total + ?", (user_id, amount, amount))
 
-    def remove_invite(self, user_id: int, is_fake: bool = False):
-        if self.get_invites(user_id) > 0:
-            self._execute("UPDATE invites SET total = total - 1 WHERE user_id = ?", (user_id,))
-        if is_fake:
-            self._execute("INSERT INTO invites (user_id, fake) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET fake = fake + 1", (user_id,))
+    def remove_invite(self, user_id: int, amount: int = 1):
+        current = self.get_invites(user_id)
+        if current > 0:
+            new_val = max(0, current - amount)
+            self._execute("UPDATE invites SET total = ? WHERE user_id = ?", (new_val, user_id))
 
     def log_join(self, invited_id: int, inviter_id: int):
         self._execute("INSERT OR REPLACE INTO invite_logs (invited_id, inviter_id, joined_at) VALUES (?, ?, ?)", (invited_id, inviter_id, int(time.time())))
@@ -433,7 +430,7 @@ class Database:
         else: self._execute("UPDATE mc_servers SET expires_at = ? WHERE id = ?", (new_expiry, server_id))
 __ALOOZ_EOF__
 
-  # ===================== docker_utils.py =====================
+  # ===================== docker_utils.py (RAM Fix) =====================
   cat > "$INSTALL_DIR/docker_utils.py" <<'__ALOOZ_EOF__'
 """Docker wrappers for VPS containers and Minecraft servers."""
 import asyncio, os, re, secrets, shutil, socket, string, time
@@ -489,16 +486,6 @@ if [ ! -f "$JAR" ]; then
         URL="https://api.purpurmc.org/v2/purpur/$VERSION/$BUILD/download"
       fi
       wget -q -O "$JAR" "$URL" ;;
-    fabric)
-      INSTALLER=$(curl -s https://meta.fabricmc.net/v2/versions/installer | jq -r '.[0].version')
-      wget -q -O /tmp/fabric.jar "https://maven.fabricmc.net/net/fabricmc/fabric-installer/$INSTALLER/fabric-installer-$INSTALLER.jar"
-      java -jar /tmp/fabric.jar server -mcversion "$VERSION" -downloadMinecraft -dir /data
-      ;;
-    forge)
-      URL=$(curl -s "https://files.minecraftforge.net/net/minecraftforge/forge/maven-metadata.json" | jq -r --arg v "$VERSION" '.versions[]? // empty' | grep "^$VERSION-" | tail -1)
-      wget -q -O /tmp/forge.jar "https://maven.minecraftforge.net/net/minecraftforge/forge/$URL/forge-$URL-installer.jar"
-      java -jar /tmp/forge.jar --installServer /data
-      ;;
   esac
 fi
 
@@ -539,9 +526,12 @@ def port_is_free(port: int) -> bool:
         try: sock.bind(("0.0.0.0", port)); return True
         except OSError: return False
 
+# FIXED RAM LIMIT: Added --memory-reservation and --cpu-shares to strictly enforce limits.
 def build_run_args(name: str, image: str, ram_mb: int, cpu: float, disk_gb: int, port: int, password: str, use_disk_limit: bool = False) -> List[str]:
+    cpu_shares = int(cpu * 1024)
     args = ["run", "-d", "--name", name, "--hostname", name, "--restart", "unless-stopped",
-            "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}",
+            "--memory", f"{ram_mb}m", "--memory-reservation", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", 
+            "--cpus", f"{cpu:g}", "--cpu-shares", str(cpu_shares),
             "--pids-limit", "4096", "-p", f"{port}:22", "-e", f"ROOT_PASSWORD={password}",
             "--label", "alooz.vps=1"]
     if use_disk_limit: args += ["--storage-opt", f"size={disk_gb}g"]
@@ -574,7 +564,8 @@ async def set_password(name: str, password: str) -> None:
     await _docker("exec", name, "bash", "-c", 'echo "$1" > /etc/alooz_pw && chmod 600 /etc/alooz_pw && echo "root:$1" | chpasswd', "_", password, timeout=60)
 
 async def update_limits(name: str, ram_mb: int, cpu: float) -> None:
-    await _docker("update", "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", name, timeout=60)
+    cpu_shares = int(cpu * 1024)
+    await _docker("update", "--memory", f"{ram_mb}m", "--memory-reservation", f"{ram_mb}m", "--memory-swap", f"{ram_mb}m", "--cpus", f"{cpu:g}", "--cpu-shares", str(cpu_shares), name, timeout=60)
 
 async def start_sshx_and_get_url(container_name: str) -> str:
     await _run("docker", "exec", container_name, "pkill", "-f", "sshx", timeout=10)
@@ -590,8 +581,10 @@ async def start_sshx_and_get_url(container_name: str) -> str:
     raise DockerError("Could not generate SSHX URL. Check container internet access.")
 
 async def create_mc_container(name: str, mc_version: str, server_type: str, ram_mb: int, cpu: float, disk_gb: int, port: int, rcon_port: int, rcon_password: str, use_disk_limit: bool = False) -> str:
+    cpu_shares = int(cpu * 1024)
     args = ["run", "-d", "--name", name, "--hostname", name, "--restart", "unless-stopped",
-            "--memory", f"{ram_mb}m", "--memory-swap", f"{ram_mb + 512}m", "--cpus", f"{cpu:g}",
+            "--memory", f"{ram_mb}m", "--memory-reservation", f"{ram_mb}m", "--memory-swap", f"{ram_mb + 512}m", 
+            "--cpus", f"{cpu:g}", "--cpu-shares", str(cpu_shares),
             "--pids-limit", "2048", "-p", f"{port}:25565", "-p", f"{rcon_port}:25575",
             "-e", f"MC_VERSION={mc_version}", "-e", f"MC_TYPE={server_type}",
             "-e", f"MC_RAM={ram_mb}", "-e", f"MC_RCON_PW={rcon_password}",
@@ -625,14 +618,14 @@ def host_stats() -> Dict[str, float]:
     return stats
 __ALOOZ_EOF__
 
-  # ===================== bot.py (FULL V100 + Invite) =====================
+  # ===================== bot.py (V101) =====================
   cat > "$INSTALL_DIR/bot.py" <<'__ALOOZ_EOF__'
 """ALOOZ HOSTING - Discord VPS + Minecraft + Invite bot."""
 import asyncio, logging, sqlite3, os, datetime
 from typing import Optional
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import config, docker_utils as dk
 from database import Database
 
@@ -676,7 +669,6 @@ def pick_port(db_used: set, start: int, end: int) -> Optional[int]:
         if port not in db_used and dk.port_is_free(port): return port
     return None
 
-# Invite Tiers: (Invites Required, RAM MB, Disk GB, CPU Multiplier)
 INVITE_TIERS = [
     (32, 24576, 30, 6.0), (28, 20480, 30, 5.0), (24, 16384, 25, 4.0),
     (20, 12288, 20, 3.5), (16, 10240, 15, 3.0), (14, 8192, 13, 2.5),
@@ -718,20 +710,6 @@ def mc_embed(row: sqlite3.Row, status: str, *, show_rcon: bool = False, stats: d
     embed.set_footer(text="ALOOZ HOSTING • Renew for 2 invites")
     return embed
 
-class ConfirmView(discord.ui.View):
-    def __init__(self, user_id: int, timeout: float = 30):
-        super().__init__(timeout=timeout); self.user_id = user_id; self.value: Optional[bool] = None
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This prompt is not for you.", ephemeral=True); return False
-        return True
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.value = True; await interaction.response.edit_message(content="Working...", view=None); self.stop()
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.value = False; await interaction.response.edit_message(content="Cancelled.", view=None); self.stop()
-
 class AloozBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix=commands.when_mentioned, intents=discord.Intents.all())
@@ -763,11 +741,18 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except discord.HTTPException: pass
 
 # =====================================================================
-# INVITE EVENTS
+# INVITE EVENTS (90 days account check)
 # =====================================================================
 @bot.event
 async def on_member_join(member: discord.Member):
     if member.bot: return
+    
+    # 90 Days Check
+    account_age_days = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days
+    if account_age_days < 90:
+        log.info(f"{member.name} account is too new ({account_age_days} days). Invite not counted.")
+        return
+
     invites_before = {inv.code: inv.uses for inv in await member.guild.invites()}
     await asyncio.sleep(2)
     invites_after = await member.guild.invites()
@@ -778,7 +763,14 @@ async def on_member_join(member: discord.Member):
     if inviter:
         db.add_invite(inviter.id, 1)
         db.log_join(member.id, inviter.id)
-        try: await inviter.send(f"✅ **{member.name}** joined! Total invites: `{db.get_invites(inviter.id)}`")
+        total = db.get_invites(inviter.id)
+        try:
+            await inviter.send(f"✅ **{member.name}** joined! Total invites: `{total}`")
+            # Check if they hit a new tier
+            for inv, ram, disk, cpu in INVITE_TIERS:
+                if total == inv:
+                    await inviter.send(f"🎉 **CONGRATULATIONS!** You reached a new tier!\nUse `/invite-claim` to claim your {ram}MB RAM / {cpu}x CPU server!")
+                    break
         except: pass
 
 @bot.event
@@ -786,7 +778,8 @@ async def on_member_remove(member: discord.Member):
     if member.bot: return
     inviter_id = db.get_inviter(member.id)
     if inviter_id:
-        db.remove_invite(inviter_id); db.remove_join_log(member.id)
+        db.remove_invite(inviter_id)
+        db.remove_join_log(member.id)
         try:
             user = await bot.fetch_user(inviter_id)
             await user.send(f"🔴 **{member.name}** left. -1 invite. Total: `{db.get_invites(inviter_id)}`")
@@ -795,22 +788,30 @@ async def on_member_remove(member: discord.Member):
 # =====================================================================
 # INVITE COMMANDS
 # =====================================================================
-@bot.tree.command(name="invites", description="Check your invites and tier rewards")
+@bot.tree.command(name="invites", description="Check your invites")
 async def invites(interaction: discord.Interaction):
     total = db.get_invites(interaction.user.id)
-    embed = discord.Embed(title="👑 INVITE REWARD SYSTEM 👑", color=discord.Color.gold())
-    embed.add_field(name="Your Invites", value=f"📊 **{total}** valid invites", inline=False)
+    embed = discord.Embed(title="👑 Your Invite Stats", color=discord.Color.gold())
+    embed.add_field(name="Total Invites", value=f"📊 **{total}** valid invites", inline=False)
     current = None; nxt = None
     for inv, ram, disk, cpu in INVITE_TIERS:
         if total >= inv: current = (inv, ram, disk, cpu)
         else: nxt = (inv, ram, disk, cpu); break
-    if current: embed.add_field(name="🎁 Available Reward", value=f"💾 {current[1]}MB RAM • 📦 {current[2]}GB Disk • ⚡ {current[3]}x CPU", inline=False)
-    else: embed.add_field(name="🎁 Available Reward", value="No tier reached yet. Need 3 invites.", inline=False)
-    if nxt: embed.add_field(name="📈 Next Tier", value=f"{nxt[0]} invites ➜ {nxt[1]}MB RAM • {nxt[2]}GB Disk • {nxt[3]}x CPU", inline=False)
-    embed.set_footer(text="Use /invite-claim to claim your server!")
+    if current: embed.add_field(name="🎁 Current Tier", value=f"💾 {current[1]}MB RAM • 📦 {current[2]}GB Disk • ⚡ {current[3]}x CPU", inline=False)
+    if nxt: embed.add_field(name="📈 Next Tier", value=f"{nxt[0]} invites ➜ {nxt[1]}MB RAM", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="invite-claim", description="Claim a free VPS/MC server based on invites")
+@bot.tree.command(name="invites-plan", description="Show the full invite reward plan")
+async def invites_plan(interaction: discord.Interaction):
+    embed = discord.Embed(title="👑 INVITE REWARD PLAN", color=discord.Color.gold())
+    desc = ""
+    for inv, ram, disk, cpu in reversed(INVITE_TIERS):
+        desc += f"**{inv} Invites** ➜ 💾 {ram}MB RAM • 📦 {disk}GB Disk • ⚡ {cpu}x CPU\n"
+    embed.description = desc
+    embed.set_footer(text="Accounts older than 90 days count as valid invites.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="invite-claim", description="Claim your free server")
 @app_commands.describe(type="VPS or Minecraft")
 @app_commands.choices(type=[app_commands.Choice(name="Minecraft", value="mc"), app_commands.Choice(name="VPS", value="vps")])
 async def invite_claim(interaction: discord.Interaction, type: app_commands.Choice[str]):
@@ -838,23 +839,23 @@ async def invite_claim(interaction: discord.Interaction, type: app_commands.Choi
         await dk.create_mc_container(row["container"], "1.20.1", "paper", ram_mb, cpu, disk_gb, port, port+1, rcon_pw, config.USE_DISK_LIMIT)
         await interaction.followup.send(f"🎉 **Minecraft Claimed!** (#{mc_id})\nIP: `{config.SERVER_IP}:{port}`. Expires in 30 days.", ephemeral=True)
 
-@bot.tree.command(name="renew", description="Renew a VPS/MC server for 1 month using 2 invites")
+@bot.tree.command(name="renew", description="Renew a server for 1 month (Costs 2 invites)")
 @app_commands.describe(type="VPS or MC", server_id="Server ID")
 @app_commands.choices(type=[app_commands.Choice(name="VPS", value="vps"), app_commands.Choice(name="Minecraft", value="mc")])
 async def renew(interaction: discord.Interaction, type: app_commands.Choice[str], server_id: int):
     if db.get_invites(interaction.user.id) < 2:
-        return await interaction.response.send_message("❌ You need at least **2 invites** to renew.", ephemeral=True)
+        return await interaction.response.send_message("❌ You need at least **2 invites**.", ephemeral=True)
     row = db.get_vps(server_id) if type.value == "vps" else db.get_mc(server_id)
     if not row or row["owner_id"] != interaction.user.id:
-        return await interaction.response.send_message("❌ Server not found or you don't own it.", ephemeral=True)
-    db.remove_invite(interaction.user.id); db.remove_invite(interaction.user.id)
+        return await interaction.response.send_message("❌ Server not found.", ephemeral=True)
+    db.remove_invite(interaction.user.id, 2)
     db.renew_server(type.value, server_id)
-    await interaction.response.send_message(f"✅ Renewed {type.name} (#{server_id}) for 30 more days! (-2 invites)", ephemeral=True)
+    await interaction.response.send_message(f"✅ Renewed {type.name} (#{server_id}) for 30 days! (-2 invites)", ephemeral=True)
 
 # =====================================================================
-# ADMIN & VPS COMMANDS
+# ADMIN COMMANDS
 # =====================================================================
-@bot.tree.command(name="deploy", description="[Admin] Create a VPS for a member")
+@bot.tree.command(name="deploy", description="[Admin] Create a VPS for a member (Auto DMs)")
 @admin_only()
 async def deploy(interaction: discord.Interaction, member: discord.Member, ram_mb: app_commands.Range[int, 128, 262144], cpu: app_commands.Range[float, 0.1, 128.0], disk_gb: app_commands.Range[int, 1, 10000]):
     await interaction.response.defer(ephemeral=True, thinking=True)
@@ -863,24 +864,83 @@ async def deploy(interaction: discord.Interaction, member: discord.Member, ram_m
     vps_id = db.add_vps(member.id, ram_mb, float(cpu), disk_gb, port, dk.generate_password(), "ubuntu:22.04", config.SERVER_IP)
     row = db.get_vps(vps_id)
     await dk.create_vps_container(row["container"], "ubuntu:22.04", ram_mb, float(cpu), disk_gb, port, row["root_password"], config.USE_DISK_LIMIT)
+    
+    # Auto DM
+    try:
+        dm = discord.Embed(title="🎉 Your VPS is Ready!", color=discord.Color.green())
+        dm.add_field(name="VPS ID", value=f"#{vps_id}")
+        dm.add_field(name="RAM", value=f"{ram_mb} MB")
+        dm.add_field(name="SSH Command", value=f"`ssh root@{config.SERVER_IP} -p {port}`", inline=False)
+        dm.add_field(name="Password", value=f"||{row['root_password']}||", inline=False)
+        await member.send(embed=dm)
+    except: pass
+    
     await interaction.followup.send(f"VPS #{vps_id} deployed for {member.mention}.", ephemeral=True)
 
-@bot.tree.command(name="listall", description="[Admin] List every VPS")
+@bot.tree.command(name="create-mc", description="[Admin] Create a Minecraft server for a member")
 @admin_only()
-async def listall(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    rows = db.list_all_vps()
-    if not rows: return await interaction.followup.send("No VPS found.", ephemeral=True)
-    text = "\n".join(f"#{r['id']} {r['name']} <@{r['owner_id']}> - {r['ram_mb']}MB" for r in rows[:20])
-    await interaction.followup.send(embed=discord.Embed(title="All VPS", description=text), ephemeral=True)
+async def create_mc(interaction: discord.Interaction, member: discord.Member, name: str, ram_mb: app_commands.Range[int, 512, 262144], cpu: app_commands.Range[float, 0.5, 64.0], disk_gb: app_commands.Range[int, 1, 1000]):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    port = pick_port(db.used_mc_ports(), config.MC_PORT_START, config.MC_PORT_END)
+    if not port: return await interaction.followup.send("No ports available.", ephemeral=True)
+    rcon_pw = dk.generate_password()
+    mc_id = db.add_mc(member.id, name[:32], "1.20.1", "paper", ram_mb, float(cpu), disk_gb, port, port+1, rcon_pw, config.SERVER_IP)
+    row = db.get_mc(mc_id)
+    await dk.create_mc_container(row["container"], "1.20.1", "paper", ram_mb, float(cpu), disk_gb, port, port+1, rcon_pw, config.USE_DISK_LIMIT)
+    
+    # Auto DM
+    try:
+        dm = discord.Embed(title="⛏️ Your Minecraft Server is Ready!", color=discord.Color.green())
+        dm.add_field(name="Name", value=name)
+        dm.add_field(name="IP", value=f"`{config.SERVER_IP}:{port}`", inline=False)
+        dm.add_field(name="RCON", value=f"||{rcon_pw}||", inline=False)
+        await member.send(embed=dm)
+    except: pass
+    
+    await interaction.followup.send(f"Minecraft #{mc_id} deployed for {member.mention}.", ephemeral=True)
 
-@bot.tree.command(name="delete", description="[Admin] Delete a VPS")
+@bot.tree.command(name="reset-invites", description="[Admin] Reset a user's invites to 0")
 @admin_only()
-async def delete(interaction: discord.Interaction, vps_id: int):
-    row = db.get_vps(vps_id)
-    if not row: return await reply(interaction, "VPS not found.")
-    await dk.remove(row["container"]); db.delete_vps(vps_id)
-    await reply(interaction, f"VPS #{vps_id} deleted.")
+async def reset_invites(interaction: discord.Interaction, member: discord.Member):
+    db.remove_invite(member.id, db.get_invites(member.id))
+    await reply(interaction, f"Reset invites for {member.mention}.")
+
+@bot.tree.command(name="add-invites", description="[Admin] Add invites to a user")
+@admin_only()
+async def add_invites(interaction: discord.Interaction, member: discord.Member, amount: int):
+    db.add_invite(member.id, amount)
+    await reply(interaction, f"Added {amount} invites to {member.mention}. Total: {db.get_invites(member.id)}")
+
+@bot.tree.command(name="remove-invites", description="[Admin] Remove invites from a user")
+@admin_only()
+async def remove_invites(interaction: discord.Interaction, member: discord.Member, amount: int):
+    db.remove_invite(member.id, amount)
+    await reply(interaction, f"Removed {amount} invites from {member.mention}. Total: {db.get_invites(member.id)}")
+
+# =====================================================================
+# USER COMMANDS
+# =====================================================================
+@bot.tree.command(name="myvps", description="List your VPS")
+async def myvps(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    rows = db.list_vps_by_owner(interaction.user.id)
+    if not rows: return await interaction.followup.send("No VPS.", ephemeral=True)
+    embeds = []
+    for r in rows[:5]:
+        st = await dk.container_status(r["container"])
+        embeds.append(vps_embed(r, st))
+    await interaction.followup.send(embeds=embeds, ephemeral=True)
+
+@bot.tree.command(name="myserver", description="List your Minecraft servers")
+async def myserver(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    rows = db.list_mc_by_owner(interaction.user.id)
+    if not rows: return await interaction.followup.send("No Minecraft servers.", ephemeral=True)
+    embeds = []
+    for r in rows[:5]:
+        st = await dk.container_status(r["container"])
+        embeds.append(mc_embed(r, st))
+    await interaction.followup.send(embeds=embeds, ephemeral=True)
 
 @bot.tree.command(name="ssh", description="Get SSH info and web terminal link")
 async def ssh(interaction: discord.Interaction, vps_id: int):
@@ -894,28 +954,34 @@ async def ssh(interaction: discord.Interaction, vps_id: int):
     embed.add_field(name="🌐 Web Terminal", value=f"[Click Here]({url})", inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="myvps", description="List your VPS")
-async def myvps(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    rows = db.list_vps_by_owner(interaction.user.id)
-    if not rows: return await interaction.followup.send("No VPS.", ephemeral=True)
-    embeds = []
-    for r in rows[:5]:
-        st = await dk.container_status(r["container"])
-        embeds.append(vps_embed(r, st))
-    await interaction.followup.send(embeds=embeds, ephemeral=True)
+@bot.tree.command(name="resshx", description="Restart and get a new SSHX web terminal link")
+async def resshx(interaction: discord.Interaction, vps_id: int):
+    row = await get_vps_for(interaction, vps_id)
+    if not row: return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        url = await dk.start_sshx_and_get_url(row["container"])
+        await interaction.followup.send(f"🌐 **New SSHX Link:** [Click Here]({url})", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Failed: {short(e)}", ephemeral=True)
 
-@bot.tree.command(name="mc-list", description="List your Minecraft servers")
-async def mc_list(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    rows = db.list_mc_by_owner(interaction.user.id)
-    if not rows: return await interaction.followup.send("No Minecraft servers.", ephemeral=True)
-    embeds = []
-    for r in rows[:5]:
-        st = await dk.container_status(r["container"])
-        embeds.append(mc_embed(r, st))
-    await interaction.followup.send(embeds=embeds, ephemeral=True)
+@bot.tree.command(name="reinstall-os", description="Reinstall the OS on your VPS")
+@app_commands.choices(os=[app_commands.Choice(name="Ubuntu 22.04", value="ubuntu:22.04"), app_commands.Choice(name="Ubuntu 24.04", value="ubuntu:24.04"), app_commands.Choice(name="Debian 12", value="debian:12")])
+async def reinstall_os(interaction: discord.Interaction, vps_id: int, os: app_commands.Choice[str]):
+    row = await get_vps_for(interaction, vps_id)
+    if not row: return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    
+    await dk.remove(row["container"])
+    new_pw = dk.generate_password()
+    db.update_vps(vps_id, os_image=os.value, root_password=new_pw)
+    
+    await dk.create_vps_container(row["container"], os.value, row["ram_mb"], row["cpu"], row["disk_gb"], row["ssh_port"], new_pw, config.USE_DISK_LIMIT)
+    await interaction.followup.send(f"✅ OS Reinstalled to {os.name}!\nNew Root Password: ||{new_pw}||", ephemeral=True)
 
+# =====================================================================
+# UTILITY COMMANDS
+# =====================================================================
 @bot.tree.command(name="node", description="[Admin] Host server resources")
 @admin_only()
 async def node(interaction: discord.Interaction):
@@ -930,16 +996,13 @@ async def node(interaction: discord.Interaction):
 @bot.tree.command(name="help", description="Show all commands")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(title="ALOOZ HOSTING Help", color=discord.Color.blurple())
-    embed.add_field(name="🎁 Invites", value="`/invites` `/invite-claim` `/renew`", inline=False)
-    embed.add_field(name="🖥️ VPS", value="`/myvps` `/ssh`", inline=False)
-    embed.add_field(name="⛏️ MC", value="`/mc-list`", inline=False)
+    embed.add_field(name="🎁 Invites", value="`/invites` `/invites-plan` `/invite-claim` `/renew`", inline=False)
+    embed.add_field(name="🖥️ User", value="`/myvps` `/ssh` `/resshx` `/reinstall-os`", inline=False)
+    embed.add_field(name="⛏️ Minecraft", value="`/myserver`", inline=False)
     if is_admin(interaction.user.id):
-        embed.add_field(name="Admin", value="`/deploy` `/listall` `/delete` `/node`", inline=False)
+        embed.add_field(name="Admin", value="`/deploy` `/create-mc` `/add-invites` `/remove-invites` `/reset-invites` `/node`", inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 __ALOOZ_EOF__
-
-  # Fix missing import in bot.py
-  sed -i 's/from discord.ext import commands/from discord.ext import commands, tasks/' "$INSTALL_DIR/bot.py"
 
   cat > "$INSTALL_DIR/requirements.txt" <<'__ALOOZ_EOF__'
 discord.py>=2.3.2
@@ -979,7 +1042,7 @@ main_menu() {
   while true; do
     echo ""
     echo -e "\033[1;36m=========================================\033[0m"
-    echo -e "\033[1;32m    ALOOZ HOSTING - MAIN MENU (V100)     \033[0m"
+    echo -e "\033[1;32m    ALOOZ HOSTING - MAIN MENU (V101)     \033[0m"
     echo -e "\033[1;36m=========================================\033[0m"
     echo -e "  \033[1;33m1.\033[0m Set Token & Owner ID"
     echo -e "  \033[1;33m2.\033[0m Restart Bot"
